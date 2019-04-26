@@ -41,7 +41,7 @@ class NativeLibWrapper {
         )
 
         val matrix = Imgproc.getPerspectiveTransform(src_mat, dst_mat)
-        Imgproc.warpPerspective(bgr, transformed, matrix, transformed.size())
+        Imgproc.warpPerspective(bgr, transformed, matrix, transformed.size(), Imgproc.INTER_LANCZOS4)
 
         return Mat(transformed, Rect(BORDER_WIDTH, BORDER_WIDTH, TARGET_SIZE, TARGET_SIZE))
     }
@@ -55,6 +55,11 @@ class NativeLibWrapper {
 
     fun decodeString(bits: BitSet): String? {
         val buf = ByteArray(MLEN) { if (bits.get(PREFIX_LEN + it)) 1 else 0 }
+        return NativeLibWrapper().unseenCodeDecodeJNI(buf)
+    }
+
+    fun decodeString(bits: ByteArray): String? {
+        val buf = ByteArray(MLEN) { bits[PREFIX_LEN + it] }
         return NativeLibWrapper().unseenCodeDecodeJNI(buf)
     }
 

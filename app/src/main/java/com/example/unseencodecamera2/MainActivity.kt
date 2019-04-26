@@ -19,14 +19,18 @@ import android.util.SparseIntArray
 import android.view.Surface
 import android.view.TextureView
 import kotlinx.android.synthetic.main.activity_main.*
+import okhttp3.*
 import org.opencv.android.OpenCVLoader
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
 import org.opencv.core.MatOfByte
 import org.opencv.imgcodecs.Imgcodecs
+import org.opencv.imgproc.Imgproc
 import pub.devrel.easypermissions.AfterPermissionGranted
 import pub.devrel.easypermissions.EasyPermissions
 import java.io.File
-import java.util.Arrays
-import java.util.Collections
+import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import kotlin.collections.ArrayList
@@ -115,12 +119,63 @@ class MainActivity : AppCompatActivity() {
      */
     private lateinit var file: File
 
+    private val vote = ArrayList<BitSet>()
+    private var voteState = false
+    private val voteLimit = 5
+    private var decodeType = 0
+
+    private fun decodeOnServer(img: Mat): BitSet? {
+        val buffer = MatOfByte()
+        if (!Imgcodecs.imencode(".jpg", img, buffer)) {
+            throw java.lang.RuntimeException("imencode failed!")
+        }
+
+        val client = OkHttpClient()
+        val requestBody = RequestBody.create(MediaType.parse("application/octet-stream"), buffer.toArray())
+        val request = Request.Builder()
+            .url("http://127.0.0.1:5000/")
+            .post(requestBody)
+            .build()
+        val call = client.newCall(request)
+        val response = call.execute()
+
+        val answerString = response.body()?.string() ?: ""
+        Log.d(TAG, "$answerString")
+
+        if (answerString.length != CLEN - 1) {
+            Log.d(TAG, "Illegal answerString")
+            return null
+        }
+
+        val answer = BitSet(CLEN)
+        answer.set(CLEN - 1)
+
+        for (i in 0 until CLEN - 1) {
+            if (answerString[i] == '0')
+                answer.clear(i)
+            else if (answerString[i] == '1')
+                answer.set(i)
+            else {
+                Log.d(TAG, "Illegal answerString")
+                return null
+            }
+        }
+
+        return answer
+    }
+
     /**
      * This a callback object for the [ImageReader]. "onImageAvailable" will be called when a
      * still image is ready to be saved.
      */
     private val onImageAvailableListener = ImageReader.OnImageAvailableListener {
         val image = it.acquireNextImage()
+        if (!voteState || vote.size >= voteLimit) {
+            image.close()
+            Log.d(TAG, "Vote OVER. GG!")
+            return@OnImageAvailableListener
+        }
+
         val startTime = System.nanoTime()
 
         val buffer = image.planes[0].buffer
@@ -129,39 +184,27 @@ class MainActivity : AppCompatActivity() {
         image.close()
 
         // In-efficient (2050ms)
-        val mat = Imgcodecs.imdecode(MatOfByte(*bytes), Imgcodecs.IMREAD_COLOR);
+        val mBGR = Imgcodecs.imdecode(MatOfByte(*bytes), Imgcodecs.IMREAD_COLOR)
+        // Imgcodecs.imwrite("${getExternalFilesDir(null)}/capture.jpg", mBGR)
 
-        // Efficient: Image -> Bitmap -> Mat (540ms)
-        // val bitmapImage = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, null)
-        // val mat = Mat()
-        // Utils.bitmapToMat(bitmapImage, mat)
-
-        val pts = NativeLibWrapper().detectBox(mat)
+        val pts = NativeLibWrapper().detectBox(mBGR)
         if (pts == null) {
             Log.d(TAG, "No corner point found. GG!")
             return@OnImageAvailableListener
         }
-        val roi = NativeLibWrapper().correctImage(mat, pts)
-        // Imgcodecs.imwrite("${getExternalFilesDir(null)}/corrected.png", roi)
-        val bits = NativeLibWrapper().decodeUnseenCode(roi)
-        val msg = NativeLibWrapper().decodeString(bits)
 
-        Log.d(TAG, "MESSAGE: $msg")
-        Log.d(TAG, "MAT: ${mat.rows()}x${mat.cols()}")
+        val roi = NativeLibWrapper().correctImage(mBGR, pts)
+        //Imgcodecs.imwrite("${getExternalFilesDir(null)}/corrected.png", roi)
+        val bits = if (decodeType == 0)
+            NativeLibWrapper().decodeUnseenCode(roi)
+        else
+            decodeOnServer(roi) ?: return@OnImageAvailableListener
+        vote.add(bits)
+
+        // val msg = NativeLibWrapper().decodeString(bits)
+        // Log.d(TAG, "MESSAGE: $msg")
+        Log.d(TAG, "MAT: ${mBGR.rows()}x${mBGR.cols()}")
         Log.d(TAG, "Elapsed ${System.nanoTime() - startTime}")
-        //Imgcodecs.imwrite("${getExternalFilesDir(null)}/capture.jpg", mat)
-
-        if (msg != null) {
-            runOnUiThread {
-                AlertDialog.Builder(this@MainActivity)
-                    .setTitle("Result")
-                    .setMessage(msg)
-                    .create()
-                    .show()
-            }
-        }
-
-        // backgroundHandler?.post(ImageSaver(it.acquireNextImage(), file))
     }
 
     /**
@@ -267,6 +310,15 @@ class MainActivity : AppCompatActivity() {
         file = File(getExternalFilesDir(null), "capture.jpg")
         captureButton.setOnClickListener {
             captureButton.isEnabled = false
+            captureButtonNetwork.isEnabled = false
+            decodeType = 0
+            lockFocus()
+        }
+
+        captureButtonNetwork.setOnClickListener {
+            captureButton.isEnabled = false
+            captureButtonNetwork.isEnabled = false
+            decodeType = 1
             lockFocus()
         }
     }
@@ -335,21 +387,71 @@ class MainActivity : AppCompatActivity() {
                     CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: continue
 
                 // For still image captures, we use the largest available size.
-                val largest = Collections.max(
-                    Arrays.asList(*map.getOutputSizes(ImageFormat.JPEG)),
-                    CompareSizesByArea())
+                /*val largest = Collections.max(
+                    Arrays.asList(*map.getOutputSizes(ImageFormat.YUV_420_888)),
+                    CompareSizesByArea())*/
+                val largest = Size(1440, 1080)
                 imageReader = ImageReader.newInstance(largest.width, largest.height,
                     ImageFormat.JPEG, /*maxImages*/ 2).apply {
                     setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
                 }
 
                 // I want to know!
+                map.getOutputSizes(ImageFormat.RGB_565)?.forEach {
+                    Log.d(TAG,"Output: RGB_565 $it")
+                }
+                map.getOutputSizes(ImageFormat.YV12)?.forEach {
+                    Log.d(TAG,"Output: YV12 $it")
+                }
+                map.getOutputSizes(ImageFormat.NV16)?.forEach {
+                    Log.d(TAG,"Output: NV16 $it")
+                }
+                map.getOutputSizes(ImageFormat.NV21)?.forEach {
+                    Log.d(TAG,"Output: NV21 $it")
+                }
+                map.getOutputSizes(ImageFormat.YUY2)?.forEach {
+                    Log.d(TAG,"Output: YUY2 $it")
+                }
                 map.getOutputSizes(ImageFormat.JPEG)?.forEach {
                     Log.d(TAG,"Output: JPEG $it")
                 }
                 map.getOutputSizes(ImageFormat.YUV_420_888)?.forEach {
                     Log.d(TAG,"Output: YUV_420_888 $it")
                 }
+                map.getOutputSizes(ImageFormat.YUV_422_888)?.forEach {
+                    Log.d(TAG,"Output: YUV_422_888 $it")
+                }
+                map.getOutputSizes(ImageFormat.YUV_444_888)?.forEach {
+                    Log.d(TAG,"Output: YUV_444_888 $it")
+                }
+                map.getOutputSizes(ImageFormat.FLEX_RGB_888)?.forEach {
+                    Log.d(TAG,"Output: FLEX_RGB_888 $it")
+                }
+                map.getOutputSizes(ImageFormat.FLEX_RGBA_8888)?.forEach {
+                    Log.d(TAG,"Output: FLEX_RGBA_8888 $it")
+                }
+                map.getOutputSizes(ImageFormat.RAW_SENSOR)?.forEach {
+                    Log.d(TAG, "Output: RAW_SENSOR $it")
+                }
+                map.getOutputSizes(ImageFormat.RAW_PRIVATE)?.forEach {
+                    Log.d(TAG, "Output: RAW_PRIVATE $it")
+                }
+                map.getOutputSizes(ImageFormat.RAW10)?.forEach {
+                    Log.d(TAG,"Output: RAW10 $it")
+                }
+                map.getOutputSizes(ImageFormat.RAW12)?.forEach {
+                    Log.d(TAG, "Output: RAW12 $it")
+                }
+                map.getOutputSizes(ImageFormat.DEPTH16)?.forEach {
+                    Log.d(TAG, "Output: DEPTH16 $it")
+                }
+                map.getOutputSizes(ImageFormat.DEPTH_POINT_CLOUD)?.forEach {
+                    Log.d(TAG, "Output: DEPTH_POINT_CLOUD $it")
+                }
+                map.getOutputSizes(ImageFormat.PRIVATE)?.forEach {
+                    Log.d(TAG, "Output: PRIVATE $it")
+                }
+
                 val exposureTimeRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
                 Log.d(TAG, "Exposure time: $cameraId $exposureTimeRange")
                 val sensitivityRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
@@ -594,6 +696,7 @@ class MainActivity : AppCompatActivity() {
      * Lock the focus as the first step for a still image capture.
      */
     private fun lockFocus() {
+        Log.d(TAG, "Start to lock focus")
         try {
             // This is how to tell the camera to lock focus.
             previewRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER,
@@ -653,7 +756,7 @@ class MainActivity : AppCompatActivity() {
                 // setAutoFlash(it)
                 it.set(CaptureRequest.CONTROL_AE_MODE,
                     CaptureRequest.CONTROL_AE_MODE_OFF)
-                it.set(CaptureRequest.SENSOR_EXPOSURE_TIME, 6944444)
+                it.set(CaptureRequest.SENSOR_EXPOSURE_TIME, 1000000000/200)
                 it.set(CaptureRequest.SENSOR_SENSITIVITY, 800)
             }
 
@@ -663,14 +766,51 @@ class MainActivity : AppCompatActivity() {
                                                 request: CaptureRequest,
                                                 result: TotalCaptureResult) {
                     Log.d(TAG, "Capture completed!")
-                    unlockFocus()
+
+                    val bits = (0 until CLEN).map {bitLocation ->
+                        val result = vote.map{
+                            if (it[bitLocation]) 1.0 else 0.0
+                        }.average()
+
+                        if (result > 0.5)
+                            1.toByte()
+                        else if (result < 0.5)
+                            0.toByte()
+                        else
+                            listOf(0, 1).random().toByte()
+                    }.toByteArray()
+                    val msg = NativeLibWrapper().decodeString(bits)
+
+                    if ((msg != null || vote.size >= voteLimit) && voteState) {
+                        voteState = false
+
+                        captureSession?.apply {
+                            stopRepeating()
+                            abortCaptures()
+                        }
+                        unlockFocus()
+
+                        Log.d(TAG, "MESSAGE: $msg")
+                        runOnUiThread {
+                            AlertDialog.Builder(this@MainActivity)
+                                .setTitle("Result")
+                                .setMessage(msg ?: "[Failed]")
+                                .create()
+                                .show()
+                        }
+                    } else {
+                        // captureSession?.capture(captureBuilder?.build(), this, null)
+                    }
                 }
             }
 
+            vote.clear()
+            voteState = true
             captureSession?.apply {
                 stopRepeating()
                 abortCaptures()
-                capture(captureBuilder?.build(), captureCallback, null)
+                // capture(captureBuilder?.build(), captureCallback, null)
+                setRepeatingRequest(captureBuilder?.build(), captureCallback, null)
             }
         } catch (e: CameraAccessException) {
             Log.e(TAG, e.toString())
@@ -700,6 +840,7 @@ class MainActivity : AppCompatActivity() {
 
         runOnUiThread {
             captureButton.isEnabled = true
+            captureButtonNetwork.isEnabled = true
         }
     }
 
